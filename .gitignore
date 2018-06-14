@@ -1,4 +1,7 @@
 .eunit
-.rebar
+.rebar*
 _build
 ebin
+erl_crash.dump
+rebar.lock
+rebar3.crashdump

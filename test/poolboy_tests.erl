@@ -46,7 +46,10 @@ pool_test_() ->
                 fun owner_death/0
             },
             {<<"Worker checked-in after an exception in a transaction">>,
-                fun checkin_after_exception_in_transaction/0
+                fun() -> checkin_after_exception_in_transaction(nil) end
+            },
+            {<<"Worker checked-in after an exception in a transaction (weighted strategy)">>,
+                fun() -> checkin_after_exception_in_transaction(weighted) end
             },
             {<<"Pool returns status">>,
                 fun pool_returns_status/0
@@ -66,13 +69,20 @@ pool_test_() ->
             {<<"Check FIFO strategy">>,
                 fun fifo_strategy/0
             },
+            {<<"Check WEIGHTED strategy">>,
+                fun weighted_strategy/0
+            },
             {<<"Pool reuses waiting monitor when a worker exits">>,
                 fun reuses_waiting_monitor_on_worker_exit/0
             },
             {<<"Recover from timeout without exit handling">>,
-                fun transaction_timeout_without_exit/0},
+                fun() -> transaction_timeout_without_exit(nil) end},
+            {<<"Recover from timeout without exit handling (weighted strategy)">>,
+                fun() -> transaction_timeout_without_exit(weighted) end},
             {<<"Recover from transaction timeout">>,
-                fun transaction_timeout/0}
+                fun() -> transaction_timeout(nil) end},
+            {<<"Recover from transaction timeout (weighted strategy)">>,
+                fun() -> transaction_timeout(weighted) end}
         ]
     }.
 
@@ -93,8 +103,8 @@ checkin_worker(Pid, Worker) ->
     timer:sleep(500).
 
 
-transaction_timeout_without_exit() ->
-    {ok, Pid} = new_pool(1, 0),
+transaction_timeout_without_exit(Strategy) ->
+    {ok, Pid} = new_pool(1, 0, Strategy),
     ?assertEqual({ready,1,0,0}, pool_call(Pid, status)),
     WorkerList = pool_call(Pid, get_all_workers),
     ?assertMatch([_], WorkerList),
@@ -108,8 +118,8 @@ transaction_timeout_without_exit() ->
     ?assertEqual({ready,1,0,0}, pool_call(Pid, status)).
 
 
-transaction_timeout() ->
-    {ok, Pid} = new_pool(1, 0),
+transaction_timeout(Strategy) ->
+    {ok, Pid} = new_pool(1, 0, Strategy),
     ?assertEqual({ready,1,0,0}, pool_call(Pid, status)),
     WorkerList = pool_call(Pid, get_all_workers),
     ?assertMatch([_], WorkerList),
@@ -400,8 +410,8 @@ owner_death() ->
     ?assertEqual(0, length(pool_call(Pid, get_all_monitors))),
     ok = pool_call(Pid, stop).
 
-checkin_after_exception_in_transaction() ->
-    {ok, Pool} = new_pool(2, 0),
+checkin_after_exception_in_transaction(Strategy) ->
+    {ok, Pool} = new_pool(2, 0, Strategy),
     ?assertEqual(2, length(pool_call(Pool, get_avail_workers))),
     Tx = fun(Worker) ->
         ?assert(is_pid(Worker)),
@@ -505,6 +515,68 @@ fifo_strategy() ->
     Worker1 = poolboy:checkout(Pid),
     poolboy:stop(Pid).
 
+weighted_strategy() ->
+    {ok, Pid} = new_pool(2, 1, weighted),
+    Worker1 = poolboy:checkout(Pid),
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker1, 1]),
+    ok = poolboy:checkin(Pid, Worker1),
+    Worker2 = poolboy:checkout(Pid),
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker2, 2]),
+    ok = poolboy:checkin(Pid, Worker2),
+    
+    ?assert(Worker1 =/= Worker2),
+
+    WorkerAfterSort = poolboy:checkout(Pid),
+    
+    ?assert(WorkerAfterSort =:= Worker1),
+
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker1, full]),
+    ok = poolboy:checkin(Pid, WorkerAfterSort),
+    WorkerAfterWorker1Full = poolboy:checkout(Pid),
+    
+    ?assert(WorkerAfterWorker1Full =:= Worker2),
+    
+    ok = poolboy:checkin(Pid, WorkerAfterWorker1Full),
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker2, full]),
+    Worker3 = poolboy:checkout(Pid),
+    
+    ?assert(Worker3 =/= Worker1),
+    ?assert(Worker3 =/= Worker2),
+    
+    ok = poolboy:checkin(Pid, Worker3),
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker3, full]),
+    WorkerAfterAllWorkersFullBlocking = poolboy:checkout(Pid, true),
+    
+    ?assert(WorkerAfterAllWorkersFullBlocking =:= overweighted),
+    
+    WorkerAfterAllWorkersFullNonBlocking = poolboy:checkout(Pid, false),
+    
+    ?assert(WorkerAfterAllWorkersFullNonBlocking =:= overweighted),
+    
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker3, 0]),
+    dead = apply(poolboy_test_weighted_worker, die, [Worker3]),
+    Worker4 = poolboy:checkout(Pid),
+    
+    ?assert(Worker4 =/= Worker1),
+    ?assert(Worker4 =/= Worker2),
+    ?assert(Worker4 =/= Worker3),
+    ?assert(Worker4 =/= overweighted),
+    
+    ok = poolboy:checkin(Pid, Worker4),
+    ok = apply(poolboy_test_weighted_worker, set_weight, [Worker4, full]),
+    WorkerAfterAllWorkersFullBlocking2 = poolboy:checkout(Pid, true),
+    
+    ?assert(WorkerAfterAllWorkersFullBlocking2 =:= overweighted),
+    
+    WorkerAfterAllWorkersFullNonBlocking2 = poolboy:checkout(Pid, false),
+    
+    ?assert(WorkerAfterAllWorkersFullNonBlocking2 =:= overweighted),
+
+    ?assertEqual(0, length(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+    
+    poolboy:stop(Pid).
+
 reuses_waiting_monitor_on_worker_exit() ->
     {ok, Pool} = new_pool(1,0),
 
@@ -536,15 +608,26 @@ get_monitors(Pid) ->
     Monitors.
 
 new_pool(Size, MaxOverflow) ->
-    poolboy:start_link([{name, {local, poolboy_test}},
-                        {worker_module, poolboy_test_worker},
-                        {size, Size}, {max_overflow, MaxOverflow}]).
+    new_pool(Size, MaxOverflow, nil).
 
 new_pool(Size, MaxOverflow, Strategy) ->
-    poolboy:start_link([{name, {local, poolboy_test}},
-                        {worker_module, poolboy_test_worker},
-                        {size, Size}, {max_overflow, MaxOverflow},
-                        {strategy, Strategy}]).
+    {WorkerMod, WorkerArgs} =
+        case Strategy of
+            weighted -> {poolboy_test_weighted_worker, 0};
+            _ -> {poolboy_test_worker, []}
+        end,
+    PoolArgsExtra =
+        case Strategy of
+            nil -> [];
+            _ -> [{strategy, Strategy}]
+        end,
+    poolboy:start_link([
+                            {name, {local, poolboy_test}},
+                            {worker_module, WorkerMod},
+                            {size, Size},
+                            {max_overflow, MaxOverflow}
+                        ] ++ PoolArgsExtra,
+                        WorkerArgs).
 
 pool_call(ServerRef, Request) ->
     gen_server:call(ServerRef, Request).
