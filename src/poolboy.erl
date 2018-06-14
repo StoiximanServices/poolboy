@@ -44,19 +44,20 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo | weighted,
+    worker_mod :: atom()
 }).
 
--spec checkout(Pool :: pool()) -> pid().
+-spec checkout(Pool :: pool()) -> pid() | full | overweighted.
 checkout(Pool) ->
     checkout(Pool, true).
 
--spec checkout(Pool :: pool(), Block :: boolean()) -> pid() | full.
+-spec checkout(Pool :: pool(), Block :: boolean()) -> pid() | full | overweighted.
 checkout(Pool, Block) ->
     checkout(Pool, Block, ?TIMEOUT).
 
 -spec checkout(Pool :: pool(), Block :: boolean(), Timeout :: timeout())
-    -> pid() | full.
+    -> pid() | full | overweighted.
 checkout(Pool, Block, Timeout) ->
     CRef = make_ref(),
     try
@@ -151,9 +152,9 @@ init({PoolArgs, WorkerArgs}) ->
     Monitors = ets:new(monitors, [private]),
     init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
 
-init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
-    {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
-    init(Rest, WorkerArgs, State#state{supervisor = Sup});
+init([{worker_module, WorkerMod} | Rest], WorkerArgs, State) when is_atom(WorkerMod) ->
+    {ok, Sup} = poolboy_sup:start_link(WorkerMod, WorkerArgs),
+    init(Rest, WorkerArgs, State#state{supervisor = Sup, worker_mod = WorkerMod});
 init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
@@ -162,6 +163,8 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{strategy, weighted} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State#state{strategy = weighted});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
@@ -205,34 +208,67 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            workers = Workers,
            monitors = Monitors,
            overflow = Overflow,
-           max_overflow = MaxOverflow,
-           strategy = Strategy} = State,
-    case get_worker_with_strategy(Workers, Strategy) of
-        {{value, Pid},  Left} ->
-            MRef = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left}};
-        {empty, _Left} when MaxOverflow > 0, Overflow < MaxOverflow ->
-            {Pid, MRef} = new_worker(Sup, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
-        {empty, _Left} when Block =:= false ->
-            {reply, full, State};
-        {empty, _Left} ->
-            MRef = erlang:monitor(process, FromPid),
-            Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
+           strategy = Strategy,
+           worker_mod = WorkerMod,
+           max_overflow = MaxOverflow} = State,
+    WorkersLength = case Workers of undefined -> 0; _ -> queue:len(Workers) end,
+    case Workers of
+        _ when WorkersLength > 0, Strategy =:= weighted ->
+            case sort_get_not_full(WorkerMod, Workers) of
+                {Pid, Left} ->
+                    MRef = erlang:monitor(process, FromPid),
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{workers = Left}};
+                nil when MaxOverflow > 0, Overflow < MaxOverflow ->
+                    Pid = new_worker(Sup),
+                    MRef = erlang:monitor(process, FromPid),
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{overflow = Overflow + 1}};
+                _ ->
+                    {reply, overweighted, State}
+            end;
+        _ ->
+            case get_worker_with_strategy(Workers, Strategy) of
+                {{value, Pid},  Left} ->
+                    MRef = erlang:monitor(process, FromPid),
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{workers = Left}};
+                {empty, _Left} when Strategy =/= weighted, MaxOverflow > 0, Overflow < MaxOverflow ->
+                    {Pid, MRef} = new_worker(Sup, FromPid),
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{overflow = Overflow + 1}};
+                {empty, _Left} when Strategy =:= weighted orelse Block =:= false ->
+                    {reply, full, State};
+                {empty, _Left} ->
+                    MRef = erlang:monitor(process, FromPid),
+                    Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
+                    {noreply, State#state{waiting = Waiting}}
+            end
     end;
 
 handle_call(status, _From, State) ->
     #state{workers = Workers,
            monitors = Monitors,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+           worker_mod = WorkerMod,
+           strategy = Strategy} = State,
+    ReportedWorkers =
+        case Strategy of
+            weighted -> get_not_full_weighted_workers(WorkerMod, Workers, queue);
+            _ -> Workers
+        end,
     StateName = state_name(State),
-    {reply, {StateName, queue:len(Workers), Overflow, ets:info(Monitors, size)}, State};
+    {reply, {StateName, queue:len(ReportedWorkers), Overflow, ets:info(Monitors, size)}, State};
 handle_call(get_avail_workers, _From, State) ->
-    Workers = State#state.workers,
-    {reply, Workers, State};
+    #state{workers = Workers,
+           worker_mod = WorkerMod,
+           strategy = Strategy} = State,
+    ReportedWorkers =
+        case Strategy of
+            weighted -> get_not_full_weighted_workers(WorkerMod, Workers, queue);
+            _ -> Workers
+        end,
+    {reply, ReportedWorkers, State};
 handle_call(get_all_workers, _From, State) ->
     Sup = State#state.supervisor,
     WorkerList = supervisor:which_children(Sup),
@@ -259,7 +295,9 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
-           monitors = Monitors} = State,
+           monitors = Monitors,
+           overflow = Overflow,
+           strategy = Strategy} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, _, MRef}] ->
             true = erlang:demonitor(MRef),
@@ -268,9 +306,14 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             {noreply, NewState};
         [] ->
             case queue:member(Pid, State#state.workers) of
+                true when Strategy =:= weighted, Overflow > 0 ->
+                    W = filter_worker_by_pid(Pid, State#state.workers),
+                    {noreply, State#state{workers = W, overflow = Overflow - 1}};
                 true ->
                     W = filter_worker_by_pid(Pid, State#state.workers),
                     {noreply, State#state{workers = queue:in(new_worker(Sup), W)}};
+                false when Overflow > 0 ->
+                    {noreply, State#state{overflow = Overflow - 1}};
                 false ->
                     {noreply, State}
             end
@@ -306,10 +349,10 @@ new_worker(Sup, FromPid) ->
     Ref = erlang:monitor(process, FromPid),
     {Pid, Ref}.
 
-get_worker_with_strategy(Workers, fifo) ->
-    queue:out(Workers);
 get_worker_with_strategy(Workers, lifo) ->
-    queue:out_r(Workers).
+    queue:out_r(Workers);
+get_worker_with_strategy(Workers, Strategy) when Strategy =:= fifo; Strategy =:= weighted ->
+    queue:out(Workers).
 
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
@@ -332,18 +375,31 @@ handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+           strategy = Strategy,
+           worker_mod = WorkerMod,
+           workers = Workers} = State,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
+        {empty, Empty} when Strategy =:= weighted, Overflow > 0 ->
+            {NewOverflow, NewWorkers} =
+                case get_weight(WorkerMod, Pid) of
+                    0 ->
+                        ok = dismiss_worker(Sup, Pid),
+                        {Overflow - 1, Workers};
+                    _ ->
+                        {Overflow, queue:in(Pid, Workers)}
+                end,
+            State#state{waiting = Empty, overflow = NewOverflow, workers = NewWorkers};
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
-            Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = 0}
+            NewWorkers = queue:in(Pid, State#state.workers),
+            State#state{workers = NewWorkers, waiting = Empty, overflow = 0}
     end.
 
 handle_worker_exit(Pid, State) ->
@@ -375,3 +431,36 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+-spec get_not_full_weighted_workers(atom(), undefined | pid_queue(), list | queue) -> list() | pid_queue().
+get_not_full_weighted_workers(WorkerMod, Workers, list) ->
+    get_not_full_weighted_workers_list(WorkerMod, Workers);
+get_not_full_weighted_workers(WorkerMod, Workers, queue) ->
+    WorkersFiltered = get_not_full_weighted_workers_list(WorkerMod, Workers),
+    queue:from_list(WorkersFiltered).
+
+-spec get_not_full_weighted_workers_list(atom(), pid_queue()) -> list().
+get_not_full_weighted_workers_list(WorkerMod, Workers) ->
+    WorkersList = queue:to_list(Workers),
+    WorkersWeights = lists:map(fun(Worker) -> {Worker, get_weight(WorkerMod, Worker)} end, WorkersList),
+    lists:filter(fun({_Worker, Weight}) -> Weight =/= full end, WorkersWeights).
+
+-spec get_weight(atom(), pid()) -> non_neg_integer().
+get_weight(WorkerMod, Pid) ->
+    get_weight_if_alive(is_process_alive(Pid), WorkerMod, Pid).
+
+-spec get_weight_if_alive(boolean(), atom(), pid()) -> non_neg_integer().
+get_weight_if_alive(false, _Mod, _Pid) -> 0;
+get_weight_if_alive(true, WorkerMod, Pid) -> apply(WorkerMod, get_weight, [Pid]).
+
+-spec sort_get_not_full(atom(), undefined | pid_queue()) -> {pid() | nil, pid_queue()} | nil.
+sort_get_not_full(WorkerMod, Workers) ->
+    FilteredWorkersWeights = get_not_full_weighted_workers(WorkerMod, Workers, list),
+    SortedNotFull = lists:sort(fun({_Worker1, Weight1}, {_Worker2, Weight2}) -> Weight1 =< Weight2 end, FilteredWorkersWeights),
+    case SortedNotFull of
+        [{Pid, _Weight} | _Left] ->
+            NewWorkers = filter_worker_by_pid(Pid, Workers),
+            {Pid, NewWorkers};
+        _ ->
+            nil
+        end.
